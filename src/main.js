@@ -32,6 +32,7 @@ import {
 } from './renderGovernor.js';
 import { installScopeMask } from './scopeMask.js';
 import { initFirstRunExperience } from './firstRunExperience.js';
+import { applyGpuQuality, describeQualityDecision } from './gpuQuality.js';
 import { initKeySetup } from './keySetup.js';
 import { loadPhotorealisticTileset } from './mapStartup.js';
 
@@ -112,6 +113,22 @@ async function init() {
       contextOptions: {
         webgl: {
           preserveDrawingBuffer: true,
+          // Hybrid-graphics laptops (Intel iGPU + discrete NVIDIA/AMD) default
+          // their WebGL contexts to the integrated GPU, and for a photorealistic
+          // 3D globe that choice is the whole ballgame: measured on an
+          // i5-11400H with Intel UHD + RTX 2050 at 1920x945, the identical
+          // scene runs 7 FPS (114 ms/frame) on the iGPU and 78 FPS
+          // (11 ms/frame) on the discrete part.
+          //
+          // This is the standard WebGL lever for asking for the discrete part,
+          // and it is a no-op on single-GPU machines — but it is a HINT, not a
+          // guarantee. Chrome on Windows binds its GPU process to one adapter
+          // at browser launch, so it was measured NOT to switch adapters here;
+          // Firefox and some Chrome configurations do honor it. The reliable
+          // fix on Windows is an OS-level per-app assignment (Settings →
+          // Display → Graphics → Chrome → High performance). See
+          // docs/PERFORMANCE.md.
+          powerPreference: 'high-performance',
         },
       },
     });
@@ -124,6 +141,16 @@ async function init() {
     // 2026-08-05 perf investigation as a strict halving of idle burn on
     // 120 Hz hardware; a no-op on 60 Hz displays. (perf item 2)
     viewer.targetFrameRate = 60;
+
+    // Integrated and software renderers cannot afford 4x MSAA at full
+    // resolution on a photorealistic globe, so tier the quality down for them.
+    // A discrete GPU is left untouched. Runs immediately after viewer creation
+    // so the first rendered frame already reflects the decision, and before
+    // any layer registers work against the scene. See src/gpuQuality.js for
+    // the measurements behind the tiers.
+    const gpuQuality = applyGpuQuality(viewer);
+    const gpuReport = describeQualityDecision(gpuQuality);
+    console[gpuReport.level](gpuReport.message);
 
     // Register per-layer data attribution into the "Data attribution" popover.
     // Required by each source's license (ODbL, CC BY-NC-SA, NASA FIRMS, etc.);
@@ -325,6 +352,7 @@ async function init() {
       cockpitCloudEffects,
       getRenderGovernorDiagnostics,
       requestRender: governorRequestRender,
+      gpuQuality,
     };
     window.__godsEyeView.voiceCommands = initGevVoiceCommands({ viewer, styleManager, dataManager, sceneDirector, annotations });
 

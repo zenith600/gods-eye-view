@@ -119,6 +119,15 @@ const ACTIVE_FRAME_REFRESH_MS = 10000;
 const IDLE_FRAME_REFRESH_MS = 60000;
 const PROJECTION_ACTIVE_REFRESH_MS = 10000;
 const PROJECTION_IDLE_REFRESH_MS = 60000;
+/**
+ * How often a clip-backed projection re-pulls its media.
+ *
+ * A `<video>` src is set once, so without this the plane would loop the same
+ * ~11 seconds forever while the provider kept republishing. Matched to TfL's
+ * 3-minute republish cadence (the same figure cctvLod uses for its London
+ * static-frame refresh) — polling faster just re-downloads identical bytes.
+ */
+const PROJECTION_VIDEO_RELOAD_MS = 180000;
 const PROJECTION_CANVAS_WIDTH = 1920;
 const PROJECTION_CANVAS_HEIGHT = 1080;
 // Downsample grid for the unchanged-frame signature (drawProjectionFrame).
@@ -1157,6 +1166,12 @@ function buildCatalogFromSources(rawSources) {
       sourceKind: String(source.sourceKind || source.kind || (source.url ? 'configured' : 'seed')).toLowerCase(),
       feedType,
       feedConfigured: typeof source.url === 'string' && !!source.url.trim(),
+      // Optional motion clip on a stills-typed source (TfL with
+      // CCTV_TFL_VIDEO=1). The server publishes a boolean, not a URL — the
+      // clip is fetched through /api/cctv/media/:id. Only the active camera's
+      // projection consumes it; feedType stays 'image' so the ambient card
+      // tier keeps its stills.
+      hasVideoClip: source.hasVideoClip === true,
       lat,
       lon,
       headingDeg,
@@ -1676,7 +1691,10 @@ function createProjectionRuntime(record) {
   const ctx = canvas.getContext('2d', { alpha: true });
 
   const feedType = normalizeFeedType(record.camera.feedType);
-  const mode = isVideoFeedType(feedType) ? 'video' : 'image';
+  // A stills-typed camera carrying a motion clip projects as video. Only the
+  // active camera ever reaches here (one live plane at a time), so this cannot
+  // spin up more than one decoder no matter how dense the city is.
+  const mode = (isVideoFeedType(feedType) || record.camera.hasVideoClip) ? 'video' : 'image';
   const runtime = {
     mode,
     canvas,
@@ -1692,6 +1710,8 @@ function createProjectionRuntime(record) {
     bufferIndex: 0,
     lastTextureSwapAt: 0,
     lastImageRefreshAt: 0,
+    // Set on the first video-mode draw; drives PROJECTION_VIDEO_RELOAD_MS.
+    lastVideoReloadAt: 0,
     imageReady: false,
     imageLoading: false,
     imageStamp: 0,
@@ -1801,6 +1821,52 @@ function destroyProjectionRuntime(runtime) {
  * @param {Object} record - Camera record.
  * @param {boolean} [force=false] - Bypass the interval check.
  */
+/**
+ * Re-pulls a clip-backed projection's media once the reload interval elapses.
+ *
+ * Reassigning `src` on the SAME element is deliberate: the Cesium material
+ * holds a reference to that element (createProjectionRuntime binds the video
+ * directly), so swapping elements would need a material rebuild and reopen the
+ * white-flash class of bug the double-buffer logic exists to avoid.
+ *
+ * The reload waits for a loop boundary where it can — cutting a clip off
+ * mid-play is more jarring than showing it a few seconds longer — but never
+ * waits past twice the interval, so a video stalled with readyState 0 still
+ * recovers.
+ *
+ * @param {Object} record - Camera record with a video-mode projection runtime.
+ */
+function refreshProjectionVideo(record) {
+  const runtime = record?.projection;
+  if (!runtime || runtime.mode !== 'video' || !runtime.video) return;
+  // Same hidden-state gate as the image path: no refetch for a plane nobody
+  // can see. (perf wave 2)
+  if (typeof document !== 'undefined' && document.hidden) return;
+
+  const now = Date.now();
+  const last = safeNumber(runtime.lastVideoReloadAt, 0);
+  if (!last) {
+    runtime.lastVideoReloadAt = now;
+    return;
+  }
+  const elapsed = now - last;
+  if (elapsed < PROJECTION_VIDEO_RELOAD_MS) return;
+
+  const video = runtime.video;
+  // Prefer a loop boundary, but do not let a stalled element defer forever.
+  const nearLoopBoundary = video.readyState < 2
+    || !Number.isFinite(video.duration)
+    || video.duration <= 0
+    || video.currentTime <= 0.5
+    || video.currentTime >= video.duration - 0.5;
+  if (!nearLoopBoundary && elapsed < PROJECTION_VIDEO_RELOAD_MS * 2) return;
+
+  runtime.lastVideoReloadAt = now;
+  video.src = mediaUrlFor(record.camera);
+  video.load();
+  video.play().catch(() => {});
+}
+
 function refreshProjectionImage(record, force = false) {
   const runtime = record?.projection;
   if (!runtime || runtime.mode !== 'image' || !runtime.image) return;
@@ -1863,6 +1929,7 @@ function drawProjectionFrame(record) {
 
   if (runtime.mode === 'video' && runtime.video) {
     const video = runtime.video;
+    refreshProjectionVideo(record);
     if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
       runtime.ctx.clearRect(0, 0, PROJECTION_CANVAS_WIDTH, PROJECTION_CANVAS_HEIGHT);
       runtime.ctx.drawImage(video, 0, 0, PROJECTION_CANVAS_WIDTH, PROJECTION_CANVAS_HEIGHT);

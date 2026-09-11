@@ -131,7 +131,10 @@ Use the same controls before attributing a difference to the application:
 
 ## What is not established yet
 
-- This report does not establish Windows performance.
+- This report does not establish Windows performance. A separate single-machine
+  Windows capture is recorded in [Hybrid-GPU laptops (Windows)](#hybrid-gpu-laptops-windows)
+  below; it covers adapter selection and render settings, not the layer and
+  option scenes above.
 - The report does not record machine memory capacity, so it cannot support a
   minimum-memory recommendation.
 - The report does not cover other GPU renderers or viewport configurations.
@@ -142,3 +145,103 @@ Use the same controls before attributing a difference to the application:
 
 Use this page as a regression baseline for one known hardware and browser
 configuration, not as a compatibility guarantee.
+
+---
+
+# Hybrid-GPU laptops (Windows)
+
+This section records a second, independent capture on Windows. It exists
+because the dominant performance factor it found is not a rendering setting at
+all — it is which physical GPU the browser chose.
+
+## Test context
+
+| Setting | Value |
+| --- | --- |
+| Machine | Intel Core i5-11400H, 15.7 GiB RAM |
+| GPUs | Intel UHD Graphics (integrated) + NVIDIA GeForce RTX 2050 (discrete) |
+| OS | Windows 11 Home Single Language 10.0.26200 |
+| Renderer path | ANGLE / Direct3D11 |
+| Viewport | 1920 x 945 at device pixel ratio 1 |
+| Scene | Keyless Esri basemap over Austin, no layers enabled, camera parked |
+| Method | `scene.postRender` inter-frame deltas, 6 s, continuous render forced |
+
+Continuous render is forced for the measurement because the idle governor
+(`src/renderGovernor.js`) otherwise stops the loop, and the gap between
+requested frames is not frame cost.
+
+## The GPU choice dominates every render setting
+
+Identical build, identical scene, identical MSAA and resolution — only the
+adapter differs:
+
+| Adapter | FPS | Median frame | p95 frame |
+| --- | ---: | ---: | ---: |
+| Intel UHD Graphics | 7.0 | 114.4 ms | 309.2 ms |
+| NVIDIA RTX 2050 | 78.0–80.0 | 7.1–11.3 ms | 16.6–23.5 ms |
+
+That is an 11x difference, and it is the difference between an unusable
+application and a smooth one. Chrome on Windows binds its GPU process to one
+adapter at browser launch and was measured here NOT to honor the WebGL
+`powerPreference: 'high-performance'` hint that `src/main.js` requests. The
+reliable fix is an OS-level per-application assignment:
+
+- **Windows:** Settings → System → Display → Graphics → add the browser →
+  Options → High performance. Restart the browser fully.
+- **macOS:** disable Automatic Graphics Switching in Battery settings.
+
+The setting is stored per executable, so assigning one browser does not affect
+another installed browser.
+
+## Render settings on a weak adapter
+
+Measured on the Intel UHD adapter, so these are the returns available to a user
+who genuinely has no discrete GPU:
+
+| MSAA | resolutionScale | FPS | Median frame |
+| ---: | ---: | ---: | ---: |
+| 4 (as shipped) | 1.0 | 7.0 | 114.4 ms |
+| 1 | 1.0 | 10.5 | 87.4 ms |
+| 1 | 0.7 | 14.7 | 67.5 ms |
+| 1 | 0.5 | 16.2 | 59.4 ms |
+
+Roughly 2x is available, and it does not close the 11x adapter gap. Both facts
+are why `src/gpuQuality.js` degrades quality for integrated and software
+renderers *and* logs the OS-level advice above.
+
+## Automatic quality tiering
+
+`src/gpuQuality.js` classifies the WebGL `UNMASKED_RENDERER_WEBGL` string at
+startup and applies:
+
+| Tier | msaaSamples | resolutionScale |
+| --- | ---: | ---: |
+| discrete / unknown | unchanged | unchanged |
+| integrated | 1 | 0.7 |
+| software | 1 | 0.5 |
+
+An unreadable renderer string is treated as `unknown` and costs a capable
+machine nothing. Override with `?gpu=discrete` (or any tier name) on the URL,
+or persist a choice in `localStorage` under `godsEyeView.gpuQuality.v1`.
+
+End-to-end verification on the machine above, both browsers on the same dev
+server, no console errors in either:
+
+| Browser | Detected adapter | Tier | Applied | FPS |
+| --- | --- | --- | --- | ---: |
+| Chrome assigned to the RTX 2050 | NVIDIA RTX 2050 | discrete | nothing | 64.5 |
+| Chrome left on the default adapter | Intel UHD | integrated | MSAA 1x, scale 0.7 | 17.2 |
+
+The integrated row is 2.5x its 7.0 FPS as-shipped baseline.
+
+## Limits of this capture
+
+- One machine, one browser engine, one viewport. It does not establish Windows
+  performance generally.
+- Frame rates were sampled with no data layers enabled; layer activation costs
+  are not re-measured here and remain covered by the M5 baseline above.
+- The two RTX 2050 samples (78.0 and 64.5 FPS) were taken at different times
+  under different background load and are not a controlled comparison with each
+  other. Both are far above the display's 60 Hz target.
+- `powerPreference` behavior is browser- and version-specific; a future Chrome
+  may honor it and make the manual assignment unnecessary.

@@ -3540,6 +3540,31 @@ const CALTRANS_ANCHORS = [
 ];
 /** TfL JamCams: one keyless list endpoint; frames live on a public S3 bucket. */
 const TFL_JAMCAM_URL = 'https://api.tfl.gov.uk/Place/Type/JamCam';
+
+/**
+ * Opt-in: attach TfL's per-camera MP4 to each London source so the ACTIVE
+ * camera's projection plane plays motion instead of a still.
+ *
+ * Off by default because the stills-first choice is deliberate (see the
+ * feedType comment in loadTflSourcesFromOpenData). Set CCTV_TFL_VIDEO=1 to
+ * enable.
+ *
+ * What this is NOT: a live stream. TfL republishes a ~11-second clip (~115 KB)
+ * every few minutes to the same S3 key, alongside the ~13 KB JPEG. Measured
+ * 2026-09-10: both objects carried the same Last-Modified, 27 s old at fetch.
+ * So the result is looping recent motion that refreshes, not a continuous feed.
+ *
+ * Deliberately NOT implemented by flipping `feedType` to 'mp4'. The ambient
+ * card tier is stills-only by rule (`isVideoFeedType` gates both the LOD
+ * selection and hover eligibility in src/data/cctv.js), so flipping feedType
+ * would turn every London camera icon-only and blank the 20-40 thumbnail ring.
+ * Carrying the clip in a SEPARATE `videoUrl` field keeps `feedType: 'image'`
+ * — cards and the frame fallback chain are untouched — and lets only the
+ * projection runtime opt in. That also caps decoding for free: the scene holds
+ * one monitor plane at a time (the "one live plane in the world" rule), so at
+ * most one video element is ever live.
+ */
+const CCTV_TFL_VIDEO_ENABLED = /^(1|true|yes|on)$/i.test(String(process.env.CCTV_TFL_VIDEO || '').trim());
 const TFL_IMAGE_ORIGIN = 'https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/';
 const DEFAULT_TFL_MAX_SOURCES = 250;
 const LONDON_CENTER = { lat: 51.5074, lon: -0.1278 };
@@ -4149,9 +4174,18 @@ async function loadTflSourcesFromOpenData() {
         rangeM: 145,
         mountHeightM: 8,
         groundElevationM: 15, // Thames-basin prior; one-shot snap corrects.
-        feedType: 'image', // stills-first (owner decision); props.videoUrl deliberately unused
+        // Stays 'image' even with video enabled: the ambient card tier is
+        // stills-only, and `videoUrl` below is what the active camera's
+        // projection opts into. See CCTV_TFL_VIDEO_ENABLED.
+        feedType: 'image',
         url: imageUrl,
         snapshotUrl: imageUrl,
+        // Same S3 key as the JPEG with an .mp4 extension. Pinned to the
+        // official bucket by the same origin check the image URL passed.
+        videoUrl: (CCTV_TFL_VIDEO_ENABLED && typeof props.videoUrl === 'string'
+          && props.videoUrl.startsWith(TFL_IMAGE_ORIGIN))
+          ? props.videoUrl
+          : '',
         sourceKind: 'tfl-open-data',
         license: 'Powered by TfL Open Data',
       });
@@ -4193,6 +4227,10 @@ function normalizeSourceItem(item) {
     feedType: normalizeFeedType(item.feedType || item.type || ''),
     url: typeof item.url === 'string' ? item.url : '',
     snapshotUrl: typeof item.snapshotUrl === 'string' ? item.snapshotUrl : '',
+    // Optional motion clip for a stills-typed source. When set, the ACTIVE
+    // camera's projection plane plays it while the ambient card tier keeps
+    // using the still `url`. File/env catalog entries may set it too.
+    videoUrl: typeof item.videoUrl === 'string' ? item.videoUrl : '',
     license: String(item.license || item.licenseNote || ''),
     sourceKind: String(item.sourceKind || item.kind || 'configured'),
     // Optional CAL badge input (cctv-v2 design §3b/§9.2, additive-only per the
@@ -4547,10 +4585,15 @@ function cctvProxy() {
   /** Build a JSON payload describing stream info (feedType, URLs) for a camera. */
   const buildStreamPayload = (source, cameraId) => {
     const feedType = normalizeFeedType(source?.feedType || 'image');
+    // A stills-typed source carrying a `videoUrl` (TfL with CCTV_TFL_VIDEO=1)
+    // also earns a mediaUrl: its feedType stays 'image' so the card tier keeps
+    // stills, but the projection plane needs somewhere to fetch the clip.
+    const hasClip = typeof source?.videoUrl === 'string' && !!source.videoUrl.trim();
     return {
       id: cameraId,
       feedType,
-      mediaUrl: isVideoFeedType(feedType)
+      hasVideoClip: hasClip,
+      mediaUrl: (isVideoFeedType(feedType) || hasClip)
         ? `/api/cctv/media/${encodeURIComponent(cameraId)}`
         : null,
       frameUrl: `/api/cctv/frame/${encodeURIComponent(cameraId)}`,
@@ -4618,6 +4661,11 @@ function cctvProxy() {
                 mountHeightM: source.mountHeightM,
                 groundElevationM: source.groundElevationM,
                 feedType: normalizeFeedType(source.feedType),
+                // Boolean, never the URL: this endpoint deliberately publishes
+                // no upstream addresses, and the client does not need one — it
+                // fetches clips through /api/cctv/media/:id like every other
+                // media request.
+                hasVideoClip: typeof source.videoUrl === 'string' && !!source.videoUrl.trim(),
                 sourceKind: source.sourceKind || (source.url ? 'configured' : 'fallback'),
                 poseSource: source.poseSource,
                 license: source.license,
@@ -4646,8 +4694,14 @@ function cctvProxy() {
           if (url.pathname.startsWith('/media/')) {
             const cameraId = decodeURIComponent(url.pathname.replace('/media/', '').trim()) || 'camera';
             const source = sourceById.get(cameraId);
-            const mediaUrl = source?.url || '';
-            const feedType = normalizeFeedType(source?.feedType || 'image');
+            // A `videoUrl` wins over `url` here and only here: /media/ is the
+            // motion endpoint, while /frame/ keeps serving the still. Both
+            // come from the registered source, never from client input.
+            const clipUrl = String(source?.videoUrl || '').trim();
+            const mediaUrl = clipUrl || source?.url || '';
+            const feedType = clipUrl
+              ? 'mp4'
+              : normalizeFeedType(source?.feedType || 'image');
 
             if (!mediaUrl || !/^https?:\/\//i.test(mediaUrl)) {
               setHealth(cameraId, {
